@@ -3,8 +3,8 @@ import abc
 from typing import Optional, Tuple
 
 import torch
+import numpy as np
 import torch.nn.functional as F
-
 from tensordict.tensordict import TensorDict
 
 from rl4co.envs import RL4COEnvBase
@@ -362,6 +362,8 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         """
         if not self.mask_logits:  # set mask_logit to None if mask_logits is False
             mask = None
+        # print(f"step method - Input td.shape: {td.shape if td is not None else 'None'}")
+        # print(f"step method - logits.shape: {logits.shape}")
 
         logprobs = process_logits(
             logits,
@@ -631,7 +633,7 @@ class SMC(DecodingStrategy):
         self.boltzmann_temperature = boltzmann_temperature
         
         # runtime buffers
-        self.logw = None  # [BS*NP]
+        self.w = None  # [BS*NP]
         self.parents = []  # kept for compatibility; no longer required when copying-forward
         self.batch_size = None
         self.batch_sequence = None
@@ -643,15 +645,16 @@ class SMC(DecodingStrategy):
             # fallback: use env-provided starts or default to 4
             self.n_particles = max(2, int(env.get_num_starts(td)))
         assert self.n_particles >= 1, "n_particles must be >= 1"
-
+        # print(f"pre_decoder_hook - Input td.shape: {td.shape}")
+        # print(f"pre_decoder_hook - n_particles: {self.n_particles}")
         # Store model reference if provided
         self.model = kwargs.get('model', None)
 
         # Expand td to batch_size * n_particles
         td = batchify(td, self.n_particles)
-
+        # print(f"pre_decoder_hook - After batchify td.shape: {td.shape}")
         # Defer buffer init until first step when device/size are known
-        self.logw = None
+        self.w = None
         self.parents = []
         self.batch_size = None
         self.batch_sequence = None
@@ -663,10 +666,9 @@ class SMC(DecodingStrategy):
         # [BS*NP] vector: for each child row, the parent index within [0, NP)
         return torch.arange(self.n_particles, device=device).repeat_interleave(self.batch_size)
 
-    ##TODO:  Nomalizing constant
     def _group_and_normalize_weights(self, logw: torch.Tensor) -> torch.Tensor:
         # logw: [BS*NP] -> grouped weights [BS, NP]
-        grouped = logw.view(self.n_particles, self.batch_size).transpose(0, 1)  # [BS, NP]
+        grouped = logw.view(self.batch_size, self.n_particles)  # [BS, NP]
         w = torch.softmax(grouped, dim=1)
         return w
     
@@ -685,7 +687,7 @@ class SMC(DecodingStrategy):
         phi_exp_with_current = self._greedy_rollout(td, env)  # [BS*NP]
         
         # Φ_exp(x_{<t}): greedy rollout from previous state (without current action)
-        # We need to reconstruct the previous state by undoing the current step
+        # reconstruct the previous state by undoing the current step
         phi_exp_without_current = self._compute_previous_state_potential(td, env, temperature)  # [BS*NP]
         
         # Compute the ratio: Φ_exp(x_{<t} x_t) / Φ_exp(x_{<t})
@@ -703,9 +705,8 @@ class SMC(DecodingStrategy):
         if self.previous_potential is not None:
             return self.previous_potential
         else:
-            # First step: no previous potential, return zeros
-            # This makes the ratio equal to current potential
-            return torch.zeros(td.batch_size[0], device=td.device)
+            # First step: no previous potential, return ones
+            return torch.ones(td.batch_size[0], device=td.device)
     
     def _greedy_rollout(self, td: TensorDict, env: RL4COEnvBase) -> torch.Tensor:
         """Perform greedy rollout from current state to get evaluation rewards
@@ -721,6 +722,7 @@ class SMC(DecodingStrategy):
         rollout_td = td.clone()
         
         # Perform greedy rollout until done
+        rollout_logits = []
         rollout_actions = []
         while not rollout_td["done"].all():
             with torch.no_grad():
@@ -737,6 +739,7 @@ class SMC(DecodingStrategy):
                     
                     # Greedy action selection
                     action = logits.argmax(dim=-1)
+                    logits = logits.gather(dim=-1, index=action.unsqueeze(-1)).squeeze(-1)
                 else:
                     # Fallback: random valid action if no model access
                     action_mask = rollout_td.get("action_mask", None)
@@ -746,16 +749,17 @@ class SMC(DecodingStrategy):
                     else:
                         # Last resort: assume action 0 is always valid
                         action = torch.zeros(rollout_td.batch_size[0], dtype=torch.long, device=rollout_td.device)
-            
+
+            rollout_logits.append(logits)
             rollout_actions.append(action)
             rollout_td.set("action", action)
             rollout_td = env.step(rollout_td)["next"]
         
         # Get final rewards
-        final_actions = torch.stack(rollout_actions, dim=1) if rollout_actions else torch.empty((rollout_td.batch_size[0], 0), dtype=torch.long, device=rollout_td.device)
+        final_actions = torch.stack(rollout_actions, dim=1) 
         rewards = env.get_reward(rollout_td, final_actions)
-        
-        return rewards
+        cul_rollout_logits = torch.stack(rollout_logits, dim=1)
+        return rewards, cul_rollout_logits
 
     def _step(
         self,
@@ -773,68 +777,100 @@ class SMC(DecodingStrategy):
             self.batch_size = aug_batch // self.n_particles
             self.batch_sequence = torch.arange(0, self.batch_size, device=device).repeat(self.n_particles)
         
-        if self.logw is None:
-            self.logw = torch.zeros(aug_batch, device=device)
+        if self.w is None:
+            self.w = torch.zeros(aug_batch, device=device)
 
         # Select next action for each particle
         if action is None:
+            # print('sampling!')
             selected = self.sampling(logprobs, mask)
         else:
             selected = action
+        # print('logprobs', logprobs)
 
-        # Update log-weights with normalizing constant (log-sum-exp)
-        # Instead of selected action prob, use the normalizing constant
+        # Update log-weights with normalizing constant (softmax denominator)
         normalizing_constant = torch.logsumexp(logprobs, dim=1)  # [batch_size]
-        self.logw = self.logw + normalizing_constant
-
-        # Default: no resampling (identity parent)
+        self.w = self.w + normalizing_constant # [BS*NP]
+        # print('normalizing_constant', normalizing_constant)
+        # Default: no resampling 
         parent = self._identity_parent(device)
+        resampling_occurred = False
 
-        # Conditional resampling based on ESS threshold
-        if self.resample and (self.ess_threshold is not None) and (self.ess_threshold > 0.0):
-            w = self._group_and_normalize_weights(self.logw)  # [BS, NP]
-            ess = 1.0 / (w.pow(2).sum(dim=1) + 1e-12)  # [BS]
-            threshold = self.ess_threshold * float(self.n_particles)
+        # resampling active condition
+        if self.resample:
+            # Normalize weights 
+            w_grouped = self.w.view(self.batch_size, self.n_particles)  # [BS, NP]
+            w_normalized = w_grouped - torch.logsumexp(w_grouped, dim=1, keepdim=True)  # [BS, NP]
             
-            # Check if any batch needs resampling
-            if (ess < threshold).any():
-                # Apply expensive potential before resampling
-                # Compute: L_eff(x_{<t}) * Φ_exp(x_{<t} x_t) / Φ_exp(x_{<t})
-                potential_ratio = self._compute_expensive_potential(td, env=kwargs.get('env'), temperature=self.boltzmann_temperature)
-                # expensive_weights = log(L_eff(x_{<t})) + log(Φ_exp(x_{<t} x_t) / Φ_exp(x_{<t}))
-                expensive_weights = self.logw + potential_ratio
-                w_expensive = self._group_and_normalize_weights(expensive_weights)  # [BS, NP]
+            # ESS 
+            log_ess = -torch.logsumexp(w_normalized * 2, dim=1)  # [BS]
+            threshold_log = torch.log(torch.tensor(self.ess_threshold)) + torch.log(torch.tensor(self.n_particles))
+            # print('log_ess', log_ess)
+            
+            # Determine which batches need resampling
+            needs_resampling = log_ess < threshold_log  # [BS] boolean tensor
+            # print(needs_resampling.any())
+            
+            # if any batch needs resampling
+            if needs_resampling.any():
+                resampling_occurred = True
                 
-                # Multinomial resampling using expensive potential weights
-                resample_idx = torch.multinomial(w_expensive, self.n_particles, replacement=True)  # [BS, NP]
+                print("resampling")
+                
+                # Compute expensive potential for all particles (vectorized)
+                potential_ratio = self._compute_expensive_potential(td, env=kwargs.get('env'), temperature=self.boltzmann_temperature)
+                expensive_weights = self.w + potential_ratio
+                expensive_grouped = expensive_weights.view(self.batch_size, self.n_particles)  # [BS, NP]
+                expensive_normalized = expensive_grouped - torch.logsumexp(expensive_grouped, dim=1, keepdim=True)  # [BS, NP]
+                expensive_probs = torch.exp(expensive_normalized)  # [BS, NP]
+                
+                # Create identity resampling indices for batches that don't need resampling
+                identity_idx = torch.arange(self.n_particles, device=device).unsqueeze(0).expand(self.batch_size, -1)  # [BS, NP]
+                
+                # Conditional resampling: resample only for batches that need it
+                resample_idx = torch.where(
+                    needs_resampling.unsqueeze(1),  # [BS, 1]
+                    torch.multinomial(expensive_probs, self.n_particles, replacement=True),  # resampling
+                    identity_idx  # identity for batches that don't need resampling
+                )  # [BS, NP]
+                
+                # Convert to flat parent indices
                 parent = torch.hstack(torch.unbind(resample_idx, dim=1))  # [BS*NP]
                 batch_parent_idx = self.batch_sequence + parent * self.batch_size  # [BS*NP]
-                # Reorder state and reset weights after resampling
-                td = td[batch_parent_idx]
-                self.logw = self.logw[batch_parent_idx]
 
-                # reset weights -> paper implement average
-                self.logw.zero_()
+                # Reorder state and weights
+                td = td[batch_parent_idx]
+                self.w = self.w[batch_parent_idx]
+
+                # Conditional weight reset: only reset weights for batches that were resampled
+                resampling_mask = needs_resampling.repeat_interleave(self.n_particles)  # [BS*NP]
+                
+                # Calculate average weights for each batch
+                w_grouped_after = self.w.view(self.batch_size, self.n_particles)  # [BS, NP]
+                batch_avg_weights = w_grouped_after.mean(dim=1)  # [BS]
+                batch_avg_expanded = batch_avg_weights.repeat_interleave(self.n_particles)  # [BS*NP]
+                
+                # Apply weight reset only to resampled batches
+                self.w = torch.where(resampling_mask, batch_avg_expanded, self.w)
 
                 # Align current-step outputs with resampled ordering
                 selected = selected[batch_parent_idx]
                 logprobs = logprobs[batch_parent_idx]
 
-                # Copy-forward: reindex past trajectories and logprobs to reflect ancestry now
+                # Copy: reindex past trajectories and logprobs 
                 for t in range(len(self.actions)):
                     self.actions[t] = self.actions[t][batch_parent_idx]
                 for t in range(len(self.logprobs)):
                     self.logprobs[t] = self.logprobs[t][batch_parent_idx]
 
-        # Cache current potential for next step's Φ_exp(x_{<t})
-        # Only compute when not resampling to avoid extra computation
-        if not (self.resample and (self.ess_threshold is not None) and (self.ess_threshold > 0.0) and (ess < threshold).any()):
-            # Cache current state potential for next step
+        # Cache current potential for next step's Φ_exp(x_{<t}) after resampling
+        # Only cache when resampling occurred (expensive potential was computed)
+        if resampling_occurred:
+            # Cache the expensive potential that was just computed for resampling
+            # This becomes Φ_exp(x_{<t}) for the next resampling step
+            # TODO: not implement greedy rollout -> previous potential allocate
             self.previous_potential = self._greedy_rollout(td, kwargs.get('env'))
         
-        # Track genealogy (no longer required for backtracking, kept optional)
-        self.parents.append(parent)
-
         return logprobs, selected, td
 
     def _select_best_particles(
@@ -857,127 +893,4 @@ class SMC(DecodingStrategy):
             return logprobs, actions, td, env
 
 
-    # def _test_one_batch_simulation_guided_beam_search(self, episode, batch_size):
-    #     beam_width = self.tester_params['sgbs_beta']     
-    #     expansion_size_minus1 = self.tester_params['sgbs_gamma_minus1']
-    #     rollout_width = beam_width * expansion_size_minus1
-    #     aug_batch_size = self.aug_factor * batch_size
     
-    #     # Ready
-    #     ###############################################
-    #     self.model.eval()
-    #     self.env.load_problems_by_index(episode, batch_size, self.aug_factor)
-        
-    #     reset_state, _, __ = self.env.reset()
-    #     self.model.pre_forward(reset_state)
-
-
-    #     # POMO Starting Points
-    #     ###############################################
-    #     starting_points = self._get_pomo_starting_points(self.model, self.env, beam_width)
-        
-
-    #     # Beam Search
-    #     ###############################################
-    #     self.env.modify_pomo_size(beam_width)
-    #     self.env.reset()
-
-    #     # the first step, depot
-    #     selected = torch.zeros(size=(aug_batch_size, self.env.pomo_size), dtype=torch.long)
-    #     state, _, done = self.env.step(selected)
-
-    #     # the second step, pomo starting points           
-    #     state, _, done = self.env.step(starting_points)
-
-
-    #     # BS Step > 1
-    #     ###############################################
-
-    #     # Prepare Rollout-Env
-    #     rollout_env = copy.deepcopy(self.env)
-    #     rollout_env.modify_pomo_size(rollout_width)
-
-    #     # LOOP
-    #     first_rollout_flag = True
-    #     while not done:
-
-    #         # Next Nodes
-    #         ###############################################
-    #         probs = self.model.get_expand_prob(state)
-    #         # shape: (aug*batch, beam, problem+1)
-    #         ordered_prob, ordered_i = probs.sort(dim=2, descending=True)
-
-    #         greedy_next_node = ordered_i[:, :, 0]
-    #         # shape: (aug*batch, beam)
-
-    #         if first_rollout_flag:
-    #             prob_selected = ordered_prob[:, :, :expansion_size_minus1]
-    #             idx_selected = ordered_i[:, :, :expansion_size_minus1]
-    #             # shape: (aug*batch, beam, rollout_per_node)
-    #         else:
-    #             prob_selected = ordered_prob[:, :, 1:expansion_size_minus1+1]
-    #             idx_selected = ordered_i[:, :, 1:expansion_size_minus1+1]
-    #             # shape: (aug*batch, beam, rollout_per_node)
-
-    #         # replace invalid index with redundancy
-    #         next_nodes = greedy_next_node[:, :, None].repeat(1, 1, expansion_size_minus1)
-    #         is_valid = (prob_selected > 0)
-    #         next_nodes[is_valid] = idx_selected[is_valid]
-    #         # shape: (aug*batch, beam, rollout_per_node)
-
-    #         # Rollout to get rollout_reward
-    #         ###############################################
-    #         rollout_env.reset_by_repeating_bs_env(self.env, repeat=expansion_size_minus1)
-    #         rollout_env_deepcopy = copy.deepcopy(rollout_env)  # Saved for later
-
-    #         next_nodes = next_nodes.reshape(aug_batch_size, rollout_width)
-    #         # shape: (aug*batch, rollout_width)
-
-    #         rollout_state, rollout_reward, rollout_done = rollout_env.step(next_nodes)
-    #         while not rollout_done:
-    #             selected, _ = self.model(rollout_state)
-    #             # shape: (aug*batch, rollout_width)
-    #             rollout_state, rollout_reward, rollout_done = rollout_env.step(selected)
-    #         # rollout_reward.shape: (aug*batch, rollout_width)
-
-    #         # mark redundant
-    #         is_redundant = (~is_valid).reshape(aug_batch_size, rollout_width)
-    #         # shape: (aug*batch, rollout_width)
-    #         rollout_reward[is_redundant] = float('-inf')
-
-    #         # Merge Rollout-Env & BS-Env (Optional, slightly improves performance)
-    #         ###############################################
-    #         if first_rollout_flag is False:
-    #             rollout_env_deepcopy.merge(self.env)
-    #             rollout_reward = torch.cat((rollout_reward, beam_reward), dim=1)
-    #             # rollout_reward.shape: (aug*batch, rollout_width + beam_width)
-    #             next_nodes = torch.cat((next_nodes, greedy_next_node), dim=1)
-    #             # next_nodes.shape: (aug*batch, rollout_width + beam_width)
-    #         first_rollout_flag = False
-
-    #         # BS Step
-    #         ###############################################
-    #         sorted_reward, sorted_index = rollout_reward.sort(dim=1, descending=True)
-    #         beam_reward = sorted_reward[:, :beam_width]
-    #         beam_index = sorted_index[:, :beam_width]
-    #         # shape: (aug*batch, beam_width)
-
-    #         self.env.reset_by_gathering_rollout_env(rollout_env_deepcopy, gathering_index=beam_index)
-    #         selected = next_nodes.gather(dim=1, index=beam_index)
-    #         # shape: (aug*batch, beam_width)
-    #         state, reward, done = self.env.step(selected)
-
-    
-    #     # Return
-    #     ###############################################
-    #     aug_reward = reward.reshape(self.aug_factor, batch_size, self.env.pomo_size)
-    #     # shape: (augmentation, batch, pomo)
-    
-    #     max_pomo_reward = aug_reward.max(dim=2).values  # get best results from simulation guided beam search
-    #     # shape: (augmentation, batch)
-    
-    #     max_aug_pomo_reward = max_pomo_reward.max(dim=0).values  # get best results from augmentation
-    #     # shape: (batch,)
-    #     aug_score = -max_aug_pomo_reward  # negative sign to make positive value
-    
-    #     return aug_score
