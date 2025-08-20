@@ -620,7 +620,7 @@ class SMC(DecodingStrategy):
         ess_threshold: float = 0.0,
         select_best: bool = True,
         resample: bool = True,
-        boltzmann_temperature: float = 1.0,
+        temperature: float = 1.0,
         **kwargs,
     ) -> None:
         # full logp history 
@@ -630,7 +630,7 @@ class SMC(DecodingStrategy):
         self.ess_threshold = ess_threshold
         self.select_best = select_best
         self.resample = resample
-        self.boltzmann_temperature = boltzmann_temperature
+        self.temperature = temperature
         
         # runtime buffers
         self.w = None  # [BS*NP]
@@ -645,8 +645,7 @@ class SMC(DecodingStrategy):
             # fallback: use env-provided starts or default to 4
             self.n_particles = max(2, int(env.get_num_starts(td)))
         assert self.n_particles >= 1, "n_particles must be >= 1"
-        # print(f"pre_decoder_hook - Input td.shape: {td.shape}")
-        # print(f"pre_decoder_hook - n_particles: {self.n_particles}")
+
         # Store model reference if provided
         self.model = kwargs.get('model', None)
 
@@ -672,7 +671,7 @@ class SMC(DecodingStrategy):
         w = torch.softmax(grouped, dim=1)
         return w
     
-    def _compute_expensive_potential(self, td: TensorDict, env: RL4COEnvBase, temperature: float = 1.0) -> torch.Tensor:
+    def _compute_expensive_potential(self, td: TensorDict, env: RL4COEnvBase) -> torch.Tensor:
         """Compute expensive potential ratio: Φ_exp(x_{<t} x_t) / Φ_exp(x_{<t})
         
         Args:
@@ -683,30 +682,19 @@ class SMC(DecodingStrategy):
         Returns:
             Log potential ratio [BS*NP]
         """
+
         # Φ_exp(x_{<t} x_t): greedy rollout from current state (including current action)
-        phi_exp_with_current = self._greedy_rollout(td, env)  # [BS*NP]
+        phi_exp_with_current, _ = self._greedy_rollout(td, env)  # [BS*NP]
         
         # Φ_exp(x_{<t}): greedy rollout from previous state (without current action)
         # reconstruct the previous state by undoing the current step
-        phi_exp_without_current = self._compute_previous_state_potential(td, env, temperature)  # [BS*NP]
+        phi_exp_without_current = self.previous_potential if self.previous_potential is not None else torch.ones(td.batch_size[0], device=td.device)
         
         # Compute the ratio: Φ_exp(x_{<t} x_t) / Φ_exp(x_{<t})
         # In log space: log(Φ_exp(x_{<t} x_t)) - log(Φ_exp(x_{<t}))
-        potential_ratio = (-phi_exp_with_current / temperature) - (-phi_exp_without_current / temperature)
+        # potential_ratio = (-phi_exp_with_current / temperature) - (-phi_exp_without_current / temperature)
         
-        return potential_ratio
-    
-    def _compute_previous_state_potential(self, td: TensorDict, env: RL4COEnvBase, temperature: float) -> torch.Tensor:
-        """Compute Φ_exp(x_{<t}) using cached value from previous step
-        
-        Returns:
-            Previous state potential values [BS*NP]
-        """
-        if self.previous_potential is not None:
-            return self.previous_potential
-        else:
-            # First step: no previous potential, return ones
-            return torch.ones(td.batch_size[0], device=td.device)
+        return phi_exp_with_current, phi_exp_without_current
     
     def _greedy_rollout(self, td: TensorDict, env: RL4COEnvBase) -> torch.Tensor:
         """Perform greedy rollout from current state to get evaluation rewards
@@ -739,7 +727,7 @@ class SMC(DecodingStrategy):
                     
                     # Greedy action selection
                     action = logits.argmax(dim=-1)
-                    logits = logits.gather(dim=-1, index=action.unsqueeze(-1)).squeeze(-1)
+                    action_logits = logits.gather(dim=-1, index=action.unsqueeze(-1)).squeeze(-1)
                 else:
                     # Fallback: random valid action if no model access
                     action_mask = rollout_td.get("action_mask", None)
@@ -749,8 +737,10 @@ class SMC(DecodingStrategy):
                     else:
                         # Last resort: assume action 0 is always valid
                         action = torch.zeros(rollout_td.batch_size[0], dtype=torch.long, device=rollout_td.device)
+                    # For fallback case, set action_logits to zero
+                    action_logits = torch.zeros_like(action, dtype=torch.float, device=rollout_td.device)
 
-            rollout_logits.append(logits)
+            rollout_logits.append(action_logits)
             rollout_actions.append(action)
             rollout_td.set("action", action)
             rollout_td = env.step(rollout_td)["next"]
@@ -800,25 +790,25 @@ class SMC(DecodingStrategy):
         if self.resample:
             # Normalize weights 
             w_grouped = self.w.view(self.batch_size, self.n_particles)  # [BS, NP]
-            w_normalized = w_grouped - torch.logsumexp(w_grouped, dim=1, keepdim=True)  # [BS, NP]
+            #TODO: 기존 paper는 합으로 normalize 하는데, 이러면 리샘플링이 안 됨.
+            #w_normalized = w_grouped - torch.logsumexp(w_grouped, dim=1, keepdim=True)  # [BS, NP]
             
             # ESS 
-            log_ess = -torch.logsumexp(w_normalized * 2, dim=1)  # [BS]
+            log_ess = -torch.logsumexp(w_grouped * 2, dim=1)  # [BS]
             threshold_log = torch.log(torch.tensor(self.ess_threshold)) + torch.log(torch.tensor(self.n_particles))
-            # print('log_ess', log_ess)
-            
+
             # Determine which batches need resampling
             needs_resampling = log_ess < threshold_log  # [BS] boolean tensor
-            # print(needs_resampling.any())
             
             # if any batch needs resampling
             if needs_resampling.any():
                 resampling_occurred = True
                 
-                print("resampling")
+                # print("resampling")
                 
                 # Compute expensive potential for all particles (vectorized)
-                potential_ratio = self._compute_expensive_potential(td, env=kwargs.get('env'), temperature=self.boltzmann_temperature)
+                phi_exp_with_current, phi_exp_without_current = self._compute_expensive_potential(td, env=kwargs.get('env'))
+                potential_ratio = (-phi_exp_with_current / self.temperature) - (-phi_exp_without_current / self.temperature)
                 expensive_weights = self.w + potential_ratio
                 expensive_grouped = expensive_weights.view(self.batch_size, self.n_particles)  # [BS, NP]
                 expensive_normalized = expensive_grouped - torch.logsumexp(expensive_grouped, dim=1, keepdim=True)  # [BS, NP]
@@ -868,8 +858,7 @@ class SMC(DecodingStrategy):
         if resampling_occurred:
             # Cache the expensive potential that was just computed for resampling
             # This becomes Φ_exp(x_{<t}) for the next resampling step
-            # TODO: not implement greedy rollout -> previous potential allocate
-            self.previous_potential = self._greedy_rollout(td, kwargs.get('env'))
+            self.previous_potential = phi_exp_with_current
         
         return logprobs, selected, td
 
@@ -892,5 +881,3 @@ class SMC(DecodingStrategy):
         else:
             return logprobs, actions, td, env
 
-
-    
